@@ -7,20 +7,20 @@ if ! command -v helm &>/dev/null; then
     curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 fi
 
-# "====== Removing control-plane taint so core pods can schedule on master ======"
+echo "====== Removing control-plane taint so core pods can schedule on master ======"
 kubectl taint node cluster2-master node-role.kubernetes.io/control-plane:NoSchedule- 2>/dev/null || true
 kubectl taint node cluster2-master node-role.kubernetes.io/master:NoSchedule- 2>/dev/null || true
 
-# "====== Uninstalling any existing OpenWhisk release ======"
+echo "====== Uninstalling any existing OpenWhisk release ======"
 helm uninstall owdev -n openwhisk 2>/dev/null || true
 kubectl delete pods -n openwhisk --all --force --grace-period=0 2>/dev/null || true
 sleep 10
 
-# "====== Deleting old PVCs (storageClassName is immutable - must recreate) ======"
+echo "====== Deleting old PVCs (storageClassName is immutable - must recreate) ======"
 kubectl delete pvc --all -n openwhisk 2>/dev/null || true
 sleep 5
 
-# "====== Creating StorageClass ======"
+echo "====== Creating StorageClass ======"
 cat <<EOF | kubectl apply -f -
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -30,15 +30,25 @@ provisioner: kubernetes.io/no-provisioner
 volumeBindingMode: WaitForFirstConsumer
 EOF
 
-# "====== Creating local directories on master ======"
+echo "====== Creating local directories on master ======"
 mkdir -p /mnt/pv-couchdb /mnt/pv-kafka /mnt/pv-zookeeper-data /mnt/pv-zookeeper-log /mnt/pv-redis
 chmod 777 /mnt/pv-couchdb /mnt/pv-kafka /mnt/pv-zookeeper-data /mnt/pv-zookeeper-log /mnt/pv-redis
 
-# "====== Deleting old PVs if they exist ======"
+echo "====== Deleting old PVs if they exist ======"
 kubectl delete pv pv-couchdb pv-kafka pv-zookeeper-data pv-zookeeper-log pv-redis 2>/dev/null || true
 sleep 3
 
-# "====== Creating PersistentVolumes ======"
+echo "====== Force-removing any PVs stuck in Terminating ======"
+for PV in $(kubectl get pv -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+    kubectl patch pv "$PV" -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+done
+kubectl delete pv pv-couchdb pv-kafka pv-zookeeper-data pv-zookeeper-log pv-redis pv-alarmprovider 2>/dev/null || true
+sleep 5
+
+echo "====== Clearing PV data directories ======"
+rm -rf /mnt/pv-couchdb/* /mnt/pv-kafka/* /mnt/pv-zookeeper-data/* /mnt/pv-zookeeper-log/* /mnt/pv-redis/* /mnt/pv-alarmprovider/*
+
+echo "====== Creating PersistentVolumes (sizes match OpenWhisk Helm chart defaults) ======"
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: PersistentVolume
@@ -46,7 +56,7 @@ metadata:
   name: pv-couchdb
 spec:
   capacity:
-    storage: 200Mi
+    storage: 2Gi
   accessModes:
     - ReadWriteOnce
   persistentVolumeReclaimPolicy: Retain
@@ -68,7 +78,7 @@ metadata:
   name: pv-kafka
 spec:
   capacity:
-    storage: 200Mi
+    storage: 512Mi
   accessModes:
     - ReadWriteOnce
   persistentVolumeReclaimPolicy: Retain
@@ -90,7 +100,7 @@ metadata:
   name: pv-zookeeper-data
 spec:
   capacity:
-    storage: 200Mi
+    storage: 256Mi
   accessModes:
     - ReadWriteOnce
   persistentVolumeReclaimPolicy: Retain
@@ -112,7 +122,7 @@ metadata:
   name: pv-zookeeper-log
 spec:
   capacity:
-    storage: 200Mi
+    storage: 256Mi
   accessModes:
     - ReadWriteOnce
   persistentVolumeReclaimPolicy: Retain
@@ -134,7 +144,7 @@ metadata:
   name: pv-redis
 spec:
   capacity:
-    storage: 200Mi
+    storage: 256Mi
   accessModes:
     - ReadWriteOnce
   persistentVolumeReclaimPolicy: Retain
@@ -149,11 +159,33 @@ spec:
               operator: In
               values:
                 - cluster2-master
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-alarmprovider
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-storage
+  local:
+    path: /mnt/pv-alarmprovider
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - cluster2-master
 EOF
 
 kubectl get pv
 
-# "====== Installing OpenWhisk via Helm ======"
+echo "====== Installing OpenWhisk via Helm ======"
 helm repo add openwhisk https://openwhisk.apache.org/charts 2>/dev/null || true
 helm repo update
 kubectl create namespace openwhisk 2>/dev/null || true
@@ -213,7 +245,19 @@ helm install owdev openwhisk/openwhisk \
     --namespace openwhisk \
     --values /tmp/openwhisk-values.yaml \
     --timeout 20m \
-    --wait
+    --wait || true
+
+echo ""
+echo "====== Patching any PVCs missing storageClassName ======"
+for PVC in $(kubectl get pvc -n openwhisk -o jsonpath='{.items[*].metadata.name}'); do
+    SC=$(kubectl get pvc "$PVC" -n openwhisk -o jsonpath='{.spec.storageClassName}')
+    if [ -z "$SC" ] || [ "$SC" = "null" ]; then
+        kubectl patch pvc "$PVC" -n openwhisk \
+            --type=merge \
+            -p='{"spec":{"storageClassName":"local-storage"}}' 2>/dev/null || true
+        echo "Patched $PVC"
+    fi
+done
 
 echo ""
 kubectl get pv
